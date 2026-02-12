@@ -1,0 +1,3 @@
+# Dependencies for fetch_hotels_mcp.py (Trivago MCP client)
+# Install: pip install -r requirements-mcp-hotels.txt
+mcp[cli]>=1.26.0
