@@ -69,7 +69,7 @@ print(trips[0])  # Trip(totalPrice=85.31, outbound=Flight(departureTime=datetime
 
 ## Travel helper (flights + hotels)
 
-The `travel_helper.py` script finds cheap Ryanair outbound flights, picks the N cheapest, and fetches M hotel options per flight from the Trivago MCP server (2 nights starting on the flight date).
+The `travel_helper.py` script finds **round trips** from Düsseldorf Weeze (NRN) and Köln (CGN): outbound on **Thursday after 5 pm** or **Friday after 11 pm**, **3–4 nights** at destination, return to Weeze/Köln. It picks the 10 cheapest such trips and fetches M hotel options per trip (4 nights) from the Trivago MCP server.
 
 ### Setup
 
@@ -83,7 +83,7 @@ python3 -m venv .venv-travel
 ### Run
 
 ```bash
-# Default: 3 cheapest flights, 3 hotels per flight (human-readable)
+# Default: 10 cheapest round trips, 3 hotels per trip (human-readable)
 .venv-travel/bin/python travel_helper.py
 
 # JSON output (e.g. for OpenClaw)
@@ -105,7 +105,7 @@ python3 -m venv .venv-travel
 |--------|---------|-------------|
 | `--json` | — | Machine-readable JSON output |
 | `--no-hotels` | — | Skip Trivago; show only flights |
-| `--num-cheapest` | 3 | Number of cheapest flights to show and fetch hotels for |
+| `--num-cheapest` | 10 | Number of cheapest round trips to show and fetch hotels for |
 | `--hotels-per-flight` | 3 | Number of hotels to fetch per flight |
 | `--adults` | 2 | Adults for hotel search |
 | `--rooms` | 1 | Rooms for hotel search |
