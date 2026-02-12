@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-Travel helper: collect all cheap Ryanair flights, then fetch 3 hotels for the 3 cheapest flights.
+Travel helper: cheap round-trip flights from Düsseldorf Weeze / Köln, then hotels.
 
-1. Collects all outbound flights (under max price) from configured origins.
-2. Picks the 3 cheapest flights by price.
-3. For each of those 3, asks the Trivago MCP server for 3 hotels (2 nights from flight date).
+1. Collects return trips from Weeze (NRN) and Köln (CGN). Only the departure (outbound) must
+   match the schedule: Thursday after 5 pm or Friday after 11 pm. Return is 3–4 nights later
+   (any time); no schedule restriction on the return flight.
+2. Picks the 10 cheapest such trips by outbound price.
+3. For each, fetches hotels for 3–4 nights from the Trivago MCP server.
 
 Callable by OpenClaw:
   - Run: python travel_helper.py [--json] [--no-hotels]
@@ -39,17 +41,37 @@ try:
 except ImportError:
     TRIVAGO_AVAILABLE = False
 
-# --------------- Config (aligned with ryanair_flights_with_weekday.py) ---------------
+# --------------- Config: Weeze + Köln, Thu eve / Fri late outbound, 3–4 nights ---------------
 ORIGIN_AIRPORTS = [
-    ("CGN", "Cologne Bonn"),
-    ("NRN", "Weeze"),
+    ("CGN", "Köln"),
+    ("NRN", "Düsseldorf Weeze"),
 ]
-DAYS_AHEAD = 14
-RETURN_DAYS_MIN = 2
-RETURN_DAYS_MAX = 3
-MAX_FLIGHT_PRICE = 80
-HOTEL_NIGHTS = 2
+DAYS_AHEAD = 28  # search further ahead for Thu/Fri departures
+RETURN_DAYS_MIN = 2  # 2 nights at destination
+RETURN_DAYS_MAX = 4  # 4 nights at destination
+HOTEL_NIGHTS = 4  # legacy; hotel stay now matches return flight (arrival = outbound date, departure = return date)
 TRIVAGO_MCP_URL = "https://mcp.trivago.com/mcp"
+
+# Only the departure (outbound) is restricted: Thursday >= 17:00, or Friday >= 23:00 (11 pm).
+# Return flight is 3–4 nights later with no time-of-day restriction. Monday=0 in weekday().
+THURSDAY = 3
+FRIDAY = 4
+OUTBOUND_THURSDAY_AFTER_HOUR = 17
+OUTBOUND_FRIDAY_AFTER_HOUR = 23  # 11 pm
+
+# Display: separator between the two legs on one line
+LEG_SEP = "  |  "    # between outbound and inbound on one line
+
+
+def _outbound_departure_allowed(dt: datetime) -> bool:
+    """True if outbound departure is Thursday after 5 pm or Friday after 11 pm (only departure is restricted)."""
+    wd = dt.weekday()
+    hour = dt.hour
+    if wd == THURSDAY:
+        return hour >= OUTBOUND_THURSDAY_AFTER_HOUR
+    if wd == FRIDAY:
+        return hour >= OUTBOUND_FRIDAY_AFTER_HOUR
+    return False
 
 
 def _parse_price_night(h: dict) -> float:
@@ -117,37 +139,35 @@ async def _top_hotels_for_destination(
 
 
 async def fetch_hotels_for_cheapest_flights(
-    cheapest_flights: list[tuple[str, object, float]],
+    cheapest_flights: list[tuple[object, object, float]],
     hotels_per_flight: int = 3,
     adults: int = 2,
     rooms: int = 1,
 ) -> list[dict]:
     """
-    For each of the given (flight_type, flight, price) entries, fetch hotels_per_flight hotels
-    for that flight's destination and dates (2 nights from flight date).
-    Returns list of { "destination", "arrival", "departure", "flight", "price", "hotels": [...] }.
+    For each (outbound, return_flight, price) entry, fetch hotels_per_flight hotels
+    for that destination. Hotel stay = arrival (outbound date) to departure (return flight date).
+    Returns list of { "destination", "arrival", "departure", "flight", "return_flight", "price", "hotels": [...] }.
     """
     if not TRIVAGO_AVAILABLE or not cheapest_flights:
         return []
-    # Build (dest_city, arrival, departure) for each flight
     tasks = []
-    for _ft, flight, price in cheapest_flights:
+    for outbound, return_flight, price in cheapest_flights:
         dest_city = (
-            flight.destinationFull.split(",")[0].strip()
-            if "," in flight.destinationFull
-            else flight.destinationFull
+            outbound.destinationFull.split(",")[0].strip()
+            if "," in outbound.destinationFull
+            else outbound.destinationFull
         )
-        flight_date = flight.departureTime.date()
-        arrival = flight_date.isoformat()
-        departure = (flight_date + timedelta(days=HOTEL_NIGHTS)).isoformat()
-        tasks.append((dest_city, arrival, departure, flight, price))
+        arrival = outbound.departureTime.date().isoformat()
+        departure = return_flight.departureTime.date().isoformat()
+        tasks.append((dest_city, arrival, departure, outbound, return_flight, price))
 
     results = []
     async with streamable_http_client(TRIVAGO_MCP_URL) as streams:
         read_stream, write_stream = streams[0], streams[1]
         async with ClientSession(read_stream, write_stream) as session:
             await session.initialize()
-            for dest_city, arrival, departure, flight, price in tasks:
+            for dest_city, arrival, departure, outbound, return_flight, price in tasks:
                 hotels = await _top_hotels_for_destination(
                     session, dest_city, arrival, departure,
                     n=hotels_per_flight, adults=adults, rooms=rooms,
@@ -156,51 +176,49 @@ async def fetch_hotels_for_cheapest_flights(
                     "destination": dest_city,
                     "arrival": arrival,
                     "departure": departure,
-                    "flight": flight,
+                    "flight": outbound,
+                    "return_flight": return_flight,
                     "price": price,
                     "hotels": hotels,
                 })
     return results
 
 
-def collect_outbound_flights() -> list[tuple[str, object, float]]:
-    """Same logic as ryanair_flights_with_weekday: collect outbound flights under max price."""
+def collect_outbound_flights() -> list[tuple[object, object, float]]:
+    """Collect return trips from Weeze/Köln. Only the departure must match: Thu after 5pm or Fri after 11pm.
+    Return is 3–4 nights later (any time of day). Uses API time windows so we get trips in those slots.
+    Returns list of (outbound, return_flight, outbound_price).
+    """
     api = Ryanair(currency="EUR")
-    all_flights = []
-    all_trips = []
+    outbound = []
     for airport_code, airport_name in ORIGIN_AIRPORTS:
         for day_offset in range(0, DAYS_AHEAD):
             search_date = datetime.today().date() + timedelta(days=day_offset)
-            flights = api.get_cheapest_flights(
-                airport_code, search_date, search_date + timedelta(days=1)
-            )
-            if flights:
-                for f in flights:
-                    f._origin_airport = airport_name
-                    f._origin_code = airport_code
-                all_flights.extend(flights)
+            wd = search_date.weekday()
+            if wd == THURSDAY:
+                outbound_time_from, outbound_time_to = "17:00", "23:59"
+            elif wd == FRIDAY:
+                outbound_time_from, outbound_time_to = "23:00", "23:59"
+            else:
+                continue
             return_date_from = search_date + timedelta(days=RETURN_DAYS_MIN)
             return_date_to = search_date + timedelta(days=RETURN_DAYS_MAX)
             trips = api.get_cheapest_return_flights(
                 airport_code,
-                search_date, search_date + timedelta(days=1),
+                search_date, search_date,
                 return_date_from, return_date_to,
+                outbound_departure_time_from=outbound_time_from,
+                outbound_departure_time_to=outbound_time_to,
             )
             if trips:
                 for t in trips:
                     t._origin_airport = airport_name
                     t._origin_code = airport_code
-                all_trips.extend(trips)
-    outbound = []
-    for flight in all_flights:
-        if flight.price <= MAX_FLIGHT_PRICE:
-            outbound.append(("one-way", flight, flight.price))
-    for trip in all_trips:
-        f = trip.outbound
-        f._origin_code = trip._origin_code
-        if f.price <= MAX_FLIGHT_PRICE:
-            outbound.append(("return-outbound", f, f.price))
-    outbound.sort(key=lambda x: (x[1].departureTime.date(), x[1].destination, x[2]))
+                    ob = t.outbound
+                    ob._origin_airport = t._origin_airport
+                    ob._origin_code = t._origin_code
+                    outbound.append((ob, t.inbound, ob.price))
+    outbound.sort(key=lambda x: (x[2] + x[1].price, x[0].departureTime.date(), x[0].destination))
     return outbound
 
 
@@ -209,20 +227,19 @@ def run(
     fetch_hotels: bool = True,
     adults: int = 2,
     rooms: int = 1,
-    num_cheapest_flights: int = 3,
+    num_cheapest_flights: int = 10,
     hotels_per_flight: int = 3,
 ) -> None:
-    # 1. Collect all outbound flights
+    # 1. Collect return trips (only departure restricted: Thu after 5pm / Fri after 11pm; return 3–4 nights later, any time)
     outbound_flights = collect_outbound_flights()
-    # 2. Sort by price and take the N cheapest
-    by_price = sorted(outbound_flights, key=lambda x: (x[2], x[1].departureTime.date(), x[1].destination))
-    cheapest_flights = by_price[:num_cheapest_flights]
+    # 2. Already sorted by price; take the N cheapest
+    cheapest_flights = outbound_flights[:num_cheapest_flights]
 
-    # 3. Fetch hotels for those flights only (3 hotels per flight)
+    # 3. Fetch hotels for those flights (stay = outbound date to return date)
     hotel_results = []
     if fetch_hotels and TRIVAGO_AVAILABLE and cheapest_flights:
         if not output_json:
-            print(f"Fetching {hotels_per_flight} hotels (2 nights) for the {num_cheapest_flights} cheapest flights...", file=sys.stderr)
+            print(f"Fetching {hotels_per_flight} hotels per trip (stay = outbound date → return date) for the {num_cheapest_flights} cheapest round trips...", file=sys.stderr)
         hotel_results = asyncio.run(
             fetch_hotels_for_cheapest_flights(
                 cheapest_flights,
@@ -233,50 +250,107 @@ def run(
         )
 
     if output_json:
-        out = {
-            "cheapest_flights_with_hotels": [
-                {
-                    "departure": r["flight"].departureTime.isoformat(),
-                    "origin": r["flight"].origin,
-                    "origin_full": r["flight"].originFull,
-                    "destination": r["destination"],
-                    "destination_code": r["flight"].destination,
-                    "price_eur": r["price"],
-                    "hotel_arrival": r["arrival"],
-                    "hotel_departure": r["departure"],
-                    "hotels": r["hotels"],
-                }
-                for r in hotel_results
-            ],
-        }
+        # Prefer hotel_results when present; otherwise output flight-only from cheapest_flights
+        if hotel_results:
+            out = {
+                "cheapest_flights_with_hotels": [
+                    {
+                        "outbound": {
+                            "departure": r["flight"].departureTime.isoformat(),
+                            "origin": r["flight"].origin,
+                            "origin_full": r["flight"].originFull,
+                            "destination": r["flight"].destination,
+                            "destination_full": r["flight"].destinationFull,
+                            "price_eur": r["price"],
+                        },
+                        "return": {
+                            "departure": r["return_flight"].departureTime.isoformat(),
+                            "origin": r["return_flight"].origin,
+                            "origin_full": r["return_flight"].originFull,
+                            "destination": r["return_flight"].destination,
+                            "destination_full": r["return_flight"].destinationFull,
+                            "price_eur": r["return_flight"].price,
+                        },
+                        "hotel_arrival": r["arrival"],
+                        "hotel_departure": r["departure"],
+                        "hotels": r["hotels"],
+                    }
+                    for r in hotel_results
+                ],
+            }
+        else:
+            out = {
+                "cheapest_flights": [
+                    {
+                        "outbound": {
+                            "departure": ob.departureTime.isoformat(),
+                            "origin": ob.origin,
+                            "origin_full": ob.originFull,
+                            "destination": ob.destination,
+                            "destination_full": ob.destinationFull,
+                            "price_eur": ob.price,
+                        },
+                        "return": {
+                            "departure": ib.departureTime.isoformat(),
+                            "origin": ib.origin,
+                            "origin_full": ib.originFull,
+                            "destination": ib.destination,
+                            "destination_full": ib.destinationFull,
+                            "price_eur": ib.price,
+                        },
+                    }
+                    for ob, ib, price in cheapest_flights
+                ],
+            }
         print(json.dumps(out, indent=2, ensure_ascii=False, default=str))
         return
 
     # Human-readable output
-    print("Travel helper: 3 cheapest flights + 3 hotels each (2 nights from flight date)")
+    print("Travel helper: round trips Weeze/Köln → destination (departure: Thu after 5pm or Fri after 11pm only), 3–4 nights, return to Weeze/Köln (return time unrestricted)")
     print("=" * 80)
-    print("CHEAPEST FLIGHTS + HOTELS")
+    print("CHEAPEST ROUND TRIPS" + (" + HOTELS" if hotel_results else " (flights only)"))
     print("-" * 80)
-    for i, r in enumerate(hotel_results, 1):
-        flight = r["flight"]
-        price = r["price"]
-        dest_city = r["destination"]
-        arrival, departure = r["arrival"], r["departure"]
-        dep_weekday = flight.departureTime.strftime("%Y-%m-%d %A %H:%M")
-        origin_city = flight.originFull.split(",")[0] if "," in flight.originFull else flight.originFull
-        print(f"{i}. {dep_weekday}  {price}€  {origin_city} ({flight._origin_code}) → {dest_city} ({flight.destination})")
-        print(f"   Hotels ({arrival} → {departure}):")
-        for j, hotel in enumerate(r["hotels"], 1):
-            name = hotel.get("Accommodation Name") or hotel.get("accommodation_name") or "—"
-            price_night = hotel.get("Price Per Night") or hotel.get("price_per_night") or "—"
-            price_stay = hotel.get("Price Per Stay") or hotel.get("price_per_stay") or "—"
-            url = hotel.get("Accommodation URL") or hotel.get("accommodation_url") or ""
-            print(f"     {j}. {name}  |  {price_night} (total {price_stay})")
-            if url:
-                print(f"        {url}")
-        if not r["hotels"]:
-            print("     (none found)")
-        print()
+    if hotel_results:
+        for i, r in enumerate(hotel_results, 1):
+            outbound = r["flight"]
+            ret = r["return_flight"]
+            price = r["price"]
+            dest_city = r["destination"]
+            arrival, departure = r["arrival"], r["departure"]
+            out_weekday = outbound.departureTime.strftime("%Y-%m-%d %A %H:%M")
+            ret_weekday = ret.departureTime.strftime("%Y-%m-%d %A %H:%M")
+            origin_city = outbound.originFull.split(",")[0] if "," in outbound.originFull else outbound.originFull
+            ret_origin_city = ret.originFull.split(",")[0] if "," in ret.originFull else ret.originFull
+            ret_dest_city = ret.destinationFull.split(",")[0].strip() if "," in ret.destinationFull else ret.destination
+            out_leg = f"{out_weekday}  {price}€  {origin_city} ({outbound._origin_code})→{dest_city} ({outbound.destination})"
+            ret_leg = f"{ret_weekday}  {ret.price}€  {ret_origin_city} ({ret.origin})→{ret_dest_city} ({ret.destination})"
+            print(f"{i}. {out_leg}{LEG_SEP}{ret_leg}")
+            nights = (datetime.fromisoformat(departure).date() - datetime.fromisoformat(arrival).date()).days
+            print(f"   Hotels ({nights} nights, {arrival} → {departure}):")
+            for j, hotel in enumerate(r["hotels"], 1):
+                name = hotel.get("Accommodation Name") or hotel.get("accommodation_name") or "—"
+                price_night = hotel.get("Price Per Night") or hotel.get("price_per_night") or "—"
+                price_stay = hotel.get("Price Per Stay") or hotel.get("price_per_stay") or "—"
+                url = hotel.get("Accommodation URL") or hotel.get("accommodation_url") or ""
+                print(f"     {j}. {name}  |  {price_night} (total {price_stay})")
+                if url:
+                    print(f"        {url}")
+            if not r["hotels"]:
+                print("     (none found)")
+            print()
+    else:
+        for i, (ob, ib, price) in enumerate(cheapest_flights, 1):
+            out_weekday = ob.departureTime.strftime("%Y-%m-%d %A %H:%M")
+            ret_weekday = ib.departureTime.strftime("%Y-%m-%d %A %H:%M")
+            origin_city = ob.originFull.split(",")[0] if "," in ob.originFull else ob.originFull
+            dest_city = ob.destinationFull.split(",")[0] if "," in ob.destinationFull else ob.destinationFull
+            ret_origin_city = ib.originFull.split(",")[0] if "," in ib.originFull else ib.originFull
+            ret_dest_city = ib.destinationFull.split(",")[0] if "," in ib.destinationFull else ib.destination
+            out_leg = f"{out_weekday}  {price}€  {origin_city} ({ob._origin_code})→{dest_city} ({ob.destination})"
+            ret_leg = f"{ret_weekday}  {ib.price}€  {ret_origin_city} ({ib.origin})→{ret_dest_city} ({ib.destination})"
+            print(f"{i}. {out_leg}{LEG_SEP}{ret_leg}")
+        if not cheapest_flights:
+            print("(No round trips found for Thu after 5pm / Fri after 11pm from Weeze or Köln.)")
     if not hotel_results and fetch_hotels and cheapest_flights:
         print("(No hotel results from Trivago.)", file=sys.stderr)
     elif not TRIVAGO_AVAILABLE and fetch_hotels:
@@ -286,7 +360,7 @@ def run(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Cheap Ryanair flights: show N cheapest flights + M hotels each (2 nights from flight date). OpenClaw-callable.",
+        description="Round trips from Weeze/Köln (Thu after 5pm or Fri after 11pm outbound, 3–4 nights, return). N cheapest + M hotels each.",
     )
     parser.add_argument(
         "--json",
@@ -304,9 +378,9 @@ def main() -> None:
     parser.add_argument(
         "--num-cheapest",
         type=int,
-        default=3,
+        default=10,
         metavar="N",
-        help="Number of cheapest flights to show and fetch hotels for (default: 3)",
+        help="Number of cheapest round trips to show and fetch hotels for (default: 10)",
     )
     parser.add_argument(
         "--hotels-per-flight",
