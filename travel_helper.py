@@ -23,6 +23,7 @@ import os
 import re
 import smtplib
 import sys
+import time
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -425,6 +426,7 @@ def _build_html(
     hotel_results: list[dict],
     adults: int = 2,
     travel_data: dict | None = None,
+    timings: dict | None = None,
 ) -> str:
     """Build results as HTML string (same content as --html file)."""
     title = "Fly cheap, stay cheap — your daily Ryanair + Trivago deals"
@@ -450,6 +452,7 @@ def _build_html(
         "    .hotel a { color: #073590; }",
         "    .flight-title, .weather-title, .attractions-title, .hotels-title { font-weight: 600; margin-bottom: 0.2rem; }",
         "    .flight, .weather, .attractions, .hotels { margin-top: 0.5rem; font-size: 0.9rem; color: #444; }",
+        "    .timings-note { margin-top: 2rem; font-size: 0.85rem; color: #666; }",
         "  </style>",
         "</head>",
         "<body>",
@@ -527,6 +530,14 @@ def _build_html(
             lines.append("  </div>")
     if not cheapest_flights:
         lines.append("  <p>(No round trips found.)</p>")
+    if timings:
+        total_s = timings.get("total") or 0
+        flights_s = timings.get("flights") or 0
+        weather_s = timings.get("weather_attractions") or 0
+        hotels_s = timings.get("hotels") or 0
+        lines.append("  <p class=\"timings-note\">")
+        lines.append(f"    Total execution time: {total_s:.1f}s. Flights: {flights_s:.1f}s, Weather &amp; attractions: {weather_s:.1f}s, Hotels: {hotels_s:.1f}s.")
+        lines.append("  </p>")
     lines.append("</body>")
     lines.append("</html>")
     return "\n".join(lines)
@@ -537,14 +548,21 @@ def _print_html(
     hotel_results: list[dict],
     adults: int = 2,
     travel_data: dict | None = None,
+    timings: dict | None = None,
 ) -> None:
     """Write results to travel_helper_YYYY-MM-DD.html and print path."""
-    html_str = _build_html(cheapest_flights, hotel_results, adults, travel_data)
+    html_str = _build_html(cheapest_flights, hotel_results, adults, travel_data, timings)
     now = datetime.now()
     filename = f"travel_helper_{now.strftime('%Y-%m-%d')}.html"
     path = Path(filename).resolve()
     path.write_text(html_str, encoding="utf-8")
     print(path, file=sys.stderr)
+    if timings:
+        total_s = timings.get("total") or 0
+        flights_s = timings.get("flights") or 0
+        weather_s = timings.get("weather_attractions") or 0
+        hotels_s = timings.get("hotels") or 0
+        print(f"Total execution time: {total_s:.1f}s. Flights: {flights_s:.1f}s, Weather & attractions: {weather_s:.1f}s, Hotels: {hotels_s:.1f}s.", file=sys.stderr)
 
 
 def _send_email_html(html_body: str, to_email: str, subject: str | None = None) -> None:
@@ -621,16 +639,22 @@ def run(
     days_ahead: int | None = None,
     email: str | None = None,
 ) -> None:
+    t_start = time.perf_counter()
+
     # 1. Collect return trips (only departure restricted: Thu after 5pm / Fri after 11pm; return 3–4 nights later, any time)
+    t0 = time.perf_counter()
     outbound_flights = collect_outbound_flights(days_ahead=days_ahead)
+    t_flights = time.perf_counter() - t0
     # 2. Already sorted by price; take the N cheapest
     cheapest_flights = outbound_flights[:num_cheapest_flights]
 
     # 3. Fetch hotels for those flights (stay = outbound date to return date)
     hotel_results = []
+    t_hotels = 0.0
     if fetch_hotels and TRIVAGO_AVAILABLE and cheapest_flights:
         if not output_json:
             print(f"Fetching {hotels_per_flight} hotels per trip (stay = outbound date → return date) for the {num_cheapest_flights} cheapest round trips...", file=sys.stderr)
+        t0 = time.perf_counter()
         hotel_results = asyncio.run(
             fetch_hotels_for_cheapest_flights(
                 cheapest_flights,
@@ -639,16 +663,28 @@ def run(
                 rooms=rooms,
             )
         )
+        t_hotels = time.perf_counter() - t0
 
     # 4. Optional: weather + attractions per destination (GeoTemp MCP)
     travel_data = None
+    t_weather_attractions = 0.0
     if GEOTEMP_AVAILABLE and (cheapest_flights or hotel_results):
         if not output_json:
             print("Fetching weather and attractions (GeoTemp)...", file=sys.stderr)
         try:
+            t0 = time.perf_counter()
             travel_data = asyncio.run(_fetch_geotemp_for_trips(cheapest_flights, hotel_results))
+            t_weather_attractions = time.perf_counter() - t0
         except Exception as e:
             print(f"GeoTemp fetch failed: {e}", file=sys.stderr)
+
+    t_total = time.perf_counter() - t_start
+    timings = {
+        "total": t_total,
+        "flights": t_flights,
+        "weather_attractions": t_weather_attractions,
+        "hotels": t_hotels,
+    }
 
     if output_json:
         # Prefer hotel_results when present; otherwise output flight-only from cheapest_flights
@@ -712,6 +748,7 @@ def run(
             hotel_results=hotel_results,
             adults=adults,
             travel_data=travel_data,
+            timings=timings,
         )
         if not email:
             return
@@ -721,6 +758,7 @@ def run(
             hotel_results=hotel_results,
             adults=adults,
             travel_data=travel_data,
+            timings=timings,
         )
         _send_email_html(html_str, email)
         if output_html:
@@ -812,6 +850,11 @@ def run(
     elif not hotel_results and fetch_hotels and cheapest_flights:
         print("(No hotel results from Trivago. Check network and that Python/SSL support HTTPS.)", file=sys.stderr)
     print("=" * 80)
+    total_s = timings.get("total") or 0
+    flights_s = timings.get("flights") or 0
+    weather_s = timings.get("weather_attractions") or 0
+    hotels_s = timings.get("hotels") or 0
+    print(f"Total execution time: {total_s:.1f}s. Flights: {flights_s:.1f}s, Weather & attractions: {weather_s:.1f}s, Hotels: {hotels_s:.1f}s.")
 
 
 def main() -> None:
