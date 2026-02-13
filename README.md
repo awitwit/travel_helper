@@ -117,3 +117,13 @@ python3 -m venv .venv-travel
 | `--rooms` | 1 | Rooms for hotel search |
 | `--num-cheapest` | 10 | Number of cheapest round trips to show and fetch hotels for |
 | `--hotels-per-flight` | 3 | Number of hotels to fetch per flight |
+| `--days-ahead` | 120 | Search for departures in the next N days |
+| `--email` | — | Send results as HTML to this address (via Gmail; see below) |
+
+**Email (Gmail):** To use `--email you@example.com`, set two environment variables (Gmail account that sends the message, and an [App Password](https://support.google.com/accounts/answer/185833)):
+
+```bash
+export GMAIL_USER=your.gmail@gmail.com
+export GMAIL_APP_PASSWORD=xxxx-xxxx-xxxx-xxxx
+.venv-travel/bin/python travel_helper.py --email ammar.sahib@yahoo.com --no-hotels
+```

@@ -47,7 +47,7 @@ ORIGIN_AIRPORTS = [
     ("CGN", "Köln"),
     ("NRN", "Düsseldorf Weeze"),
 ]
-DAYS_AHEAD = 28  # search further ahead for Thu/Fri departures
+DAYS_AHEAD = 120  # search ahead for Thu/Fri departures
 RETURN_DAYS_MIN = 2  # 2 nights at destination
 RETURN_DAYS_MAX = 4  # 4 nights at destination
 HOTEL_NIGHTS = 4  # legacy; hotel stay now matches return flight (arrival = outbound date, departure = return date)
@@ -227,8 +227,8 @@ def _print_html(
         "    .trip { margin: 1rem 0; padding: 0.75rem; border: 1px solid #ccc; border-radius: 6px; }",
         "    .trip-header { font-weight: bold; margin-bottom: 0.25rem; }",
         "    .trip-details { color: #444; font-size: 0.95rem; }",
-        "    a.book { display: inline-block; margin-top: 0.5rem; padding: 0.35rem 0.75rem; background: #073590; color: #fff; text-decoration: none; border-radius: 4px; font-size: 0.9rem; }",
-        "    a.book:hover { background: #0a47b3; }",
+        "    a.trip-link { color: #073590; text-decoration: none; }",
+        "    a.trip-link:hover { text-decoration: underline; }",
         "    .hotels { margin-top: 0.5rem; font-size: 0.9rem; }",
         "    .hotel { margin: 0.2rem 0; }",
         "    .hotel a { color: #073590; }",
@@ -254,10 +254,13 @@ def _print_html(
                 ret.departureTime.date().isoformat(),
                 adults=adults,
             )
+            out_date = outbound.departureTime.date()
+            ret_date = ret.departureTime.date()
+            nights = (ret_date - out_date).days
+            days = nights + 1
             lines.append("  <div class=\"trip\">")
-            lines.append(f"    <div class=\"trip-header\">{html.escape(dest_city)} ({total:.2f}€)</div>")
-            lines.append(f"    <div class=\"trip-details\">{html.escape(out_leg)}  |  {html.escape(ret_leg)}</div>")
-            lines.append(f"    <a class=\"book\" href=\"{html.escape(ryanair_url)}\" target=\"_blank\" rel=\"noopener\">Book</a>")
+            lines.append(f"    <div class=\"trip-header\">{html.escape(dest_city)} ({total:.2f}€) — {days} days, {nights} nights</div>")
+            lines.append(f"    <a class=\"trip-details trip-link\" href=\"{html.escape(ryanair_url)}\" target=\"_blank\" rel=\"noopener\">{html.escape(out_leg)}  |  {html.escape(ret_leg)}</a>")
             lines.append("    <div class=\"hotels\">")
             for hotel in r["hotels"]:
                 name = hotel.get("Accommodation Name") or hotel.get("accommodation_name") or "—"
@@ -283,10 +286,13 @@ def _print_html(
                 ib.departureTime.date().isoformat(),
                 adults=adults,
             )
+            out_date = ob.departureTime.date()
+            ret_date = ib.departureTime.date()
+            nights = (ret_date - out_date).days
+            days = nights + 1
             lines.append("  <div class=\"trip\">")
-            lines.append(f"    <div class=\"trip-header\">{html.escape(dest_city)} ({total:.2f}€)</div>")
-            lines.append(f"    <div class=\"trip-details\">{html.escape(out_leg)}  |  {html.escape(ret_leg)}</div>")
-            lines.append(f"    <a class=\"book\" href=\"{html.escape(ryanair_url)}\" target=\"_blank\" rel=\"noopener\">Book</a>")
+            lines.append(f"    <div class=\"trip-header\">{html.escape(dest_city)} ({total:.2f}€) — {days} days, {nights} nights</div>")
+            lines.append(f"    <a class=\"trip-details trip-link\" href=\"{html.escape(ryanair_url)}\" target=\"_blank\" rel=\"noopener\">{html.escape(out_leg)}  |  {html.escape(ret_leg)}</a>")
             lines.append("  </div>")
     if not cheapest_flights:
         lines.append("  <p>(No round trips found.)</p>")
@@ -447,9 +453,11 @@ def run(
             ret_origin_city = ret.originFull.split(",")[0] if "," in ret.originFull else ret.originFull
             ret_dest_city = ret.destinationFull.split(",")[0].strip() if "," in ret.destinationFull else ret.destination
             total = price + ret.price
+            nights = (ret.departureTime.date() - outbound.departureTime.date()).days
+            days = nights + 1
             out_leg = f"{out_weekday}  {price}€  {origin_city} ({outbound._origin_code})→{dest_city} ({outbound.destination})"
             ret_leg = f"{ret_weekday}  {ret.price}€  {ret_origin_city} ({ret.origin})→{ret_dest_city} ({ret.destination})"
-            print(f"{i}. {dest_city} ({total:.2f}€): {out_leg}{LEG_SEP}{ret_leg}")
+            print(f"{i}. {dest_city} ({total:.2f}€) — {days} days, {nights} nights: {out_leg}{LEG_SEP}{ret_leg}")
             ryanair_url = _ryanair_booking_url(
                 outbound.origin, outbound.destination,
                 outbound.departureTime.date().isoformat(),
@@ -479,9 +487,11 @@ def run(
             ret_origin_city = ib.originFull.split(",")[0] if "," in ib.originFull else ib.originFull
             ret_dest_city = ib.destinationFull.split(",")[0] if "," in ib.destinationFull else ib.destination
             total = price + ib.price
+            nights = (ib.departureTime.date() - ob.departureTime.date()).days
+            days = nights + 1
             out_leg = f"{out_weekday}  {price}€  {origin_city} ({ob._origin_code})→{dest_city} ({ob.destination})"
             ret_leg = f"{ret_weekday}  {ib.price}€  {ret_origin_city} ({ib.origin})→{ret_dest_city} ({ib.destination})"
-            print(f"{i}. {dest_city} ({total:.2f}€): {out_leg}{LEG_SEP}{ret_leg}")
+            print(f"{i}. {dest_city} ({total:.2f}€) — {days} days, {nights} nights: {out_leg}{LEG_SEP}{ret_leg}")
             ryanair_url = _ryanair_booking_url(
                 ob.origin, ob.destination,
                 ob.departureTime.date().isoformat(),
