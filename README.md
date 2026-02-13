@@ -93,6 +93,9 @@ python3 -m venv .venv-travel
 # JSON output (e.g. for OpenClaw)
 .venv-travel/bin/python travel_helper.py --json
 
+# HTML output (writes travel_helper_YYYY-MM-DD.html, full path on stderr)
+.venv-travel/bin/python travel_helper.py --html
+
 # Flights only, no hotel fetch
 .venv-travel/bin/python travel_helper.py --no-hotels
 
@@ -103,13 +106,14 @@ python3 -m venv .venv-travel
 .venv-travel/bin/python travel_helper.py --adults 2 --rooms 1
 ```
 
-### Options
+### Options (all `--` options)
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--json` | — | Machine-readable JSON output |
-| `--no-hotels` | — | Skip Trivago; show only flights |
-| `--num-cheapest` | 10 | Number of cheapest round trips to show and fetch hotels for |
-| `--hotels-per-flight` | 3 | Number of hotels to fetch per flight |
+| `--html` | — | Write results to travel_helper_YYYY-MM-DD.html (full path printed to stderr) |
+| `--no-hotels` | — | Skip Trivago hotel fetch (flights only) |
 | `--adults` | 2 | Adults for hotel search |
 | `--rooms` | 1 | Rooms for hotel search |
+| `--num-cheapest` | 10 | Number of cheapest round trips to show and fetch hotels for |
+| `--hotels-per-flight` | 3 | Number of hotels to fetch per flight |

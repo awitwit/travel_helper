@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import html
 import json
 import re
 import sys
@@ -61,6 +62,29 @@ OUTBOUND_FRIDAY_AFTER_HOUR = 23  # 11 pm
 
 # Display: separator between the two legs on one line
 LEG_SEP = "  |  "    # between outbound and inbound on one line
+
+RYANAIR_BOOKING_BASE = "https://www.ryanair.com/de/de/trip/flights/select"
+
+
+def _ryanair_booking_url(
+    origin_iata: str,
+    destination_iata: str,
+    date_out: str,
+    date_in: str,
+    adults: int = 2,
+) -> str:
+    """Build Ryanair round-trip flight select URL (German site)."""
+    params = (
+        f"adults={adults}&teens=0&children=0&infants=0"
+        f"&dateOut={date_out}&dateIn={date_in}"
+        "&isConnectedFlight=false&discount=0&promoCode=&isReturn=true"
+        f"&originIata={origin_iata}&destinationIata={destination_iata}"
+        "&tpAdults=1&tpTeens=0&tpChildren=0&tpInfants=0"
+        f"&tpStartDate={date_out}&tpEndDate={date_in}"
+        "&tpDiscount=0&tpPromoCode="
+        f"&tpOriginIata={origin_iata}&tpDestinationIata={destination_iata}"
+    )
+    return f"{RYANAIR_BOOKING_BASE}?{params}"
 
 
 def _outbound_departure_allowed(dt: datetime) -> bool:
@@ -184,6 +208,97 @@ async def fetch_hotels_for_cheapest_flights(
     return results
 
 
+def _print_html(
+    cheapest_flights: list[tuple[object, object, float]],
+    hotel_results: list[dict],
+    adults: int = 2,
+) -> None:
+    """Output results as HTML with short 'Book' links for Ryanair."""
+    title = "Travel helper: round trips Weeze/Köln"
+    lines = [
+        "<!DOCTYPE html>",
+        "<html lang=\"en\">",
+        "<head>",
+        "  <meta charset=\"utf-8\">",
+        f"  <title>{html.escape(title)}</title>",
+        "  <style>",
+        "    body { font-family: system-ui, sans-serif; margin: 1rem 2rem; max-width: 900px; }",
+        "    h1 { font-size: 1.25rem; }",
+        "    .trip { margin: 1rem 0; padding: 0.75rem; border: 1px solid #ccc; border-radius: 6px; }",
+        "    .trip-header { font-weight: bold; margin-bottom: 0.25rem; }",
+        "    .trip-details { color: #444; font-size: 0.95rem; }",
+        "    a.book { display: inline-block; margin-top: 0.5rem; padding: 0.35rem 0.75rem; background: #073590; color: #fff; text-decoration: none; border-radius: 4px; font-size: 0.9rem; }",
+        "    a.book:hover { background: #0a47b3; }",
+        "    .hotels { margin-top: 0.5rem; font-size: 0.9rem; }",
+        "    .hotel { margin: 0.2rem 0; }",
+        "    .hotel a { color: #073590; }",
+        "  </style>",
+        "</head>",
+        "<body>",
+        f"  <h1>{html.escape(title)}</h1>",
+        "  <p>Departure Thu after 5pm or Fri after 11pm; return 2–4 nights later.</p>",
+    ]
+    if hotel_results:
+        for i, r in enumerate(hotel_results, 1):
+            outbound = r["flight"]
+            ret = r["return_flight"]
+            dest_city = r["destination"]
+            total = r["price"] + ret.price
+            out_weekday = outbound.departureTime.strftime("%Y-%m-%d %A %H:%M")
+            ret_weekday = ret.departureTime.strftime("%Y-%m-%d %A %H:%M")
+            out_leg = f"{out_weekday}  {outbound.price}€  {outbound.origin}→{outbound.destination}"
+            ret_leg = f"{ret_weekday}  {ret.price}€  {ret.origin}→{ret.destination}"
+            ryanair_url = _ryanair_booking_url(
+                outbound.origin, outbound.destination,
+                outbound.departureTime.date().isoformat(),
+                ret.departureTime.date().isoformat(),
+                adults=adults,
+            )
+            lines.append("  <div class=\"trip\">")
+            lines.append(f"    <div class=\"trip-header\">{html.escape(dest_city)} ({total:.2f}€)</div>")
+            lines.append(f"    <div class=\"trip-details\">{html.escape(out_leg)}  |  {html.escape(ret_leg)}</div>")
+            lines.append(f"    <a class=\"book\" href=\"{html.escape(ryanair_url)}\" target=\"_blank\" rel=\"noopener\">Book</a>")
+            lines.append("    <div class=\"hotels\">")
+            for hotel in r["hotels"]:
+                name = hotel.get("Accommodation Name") or hotel.get("accommodation_name") or "—"
+                url = hotel.get("Accommodation URL") or hotel.get("accommodation_url") or ""
+                price_stay = hotel.get("Price Per Stay") or hotel.get("price_per_stay") or ""
+                if url:
+                    lines.append(f"      <div class=\"hotel\"><a href=\"{html.escape(url)}\" target=\"_blank\" rel=\"noopener\">{html.escape(name)}</a> {html.escape(price_stay)}</div>")
+                else:
+                    lines.append(f"      <div class=\"hotel\">{html.escape(name)} {html.escape(price_stay)}</div>")
+            lines.append("    </div>")
+            lines.append("  </div>")
+    else:
+        for i, (ob, ib, price) in enumerate(cheapest_flights, 1):
+            dest_city = ob.destinationFull.split(",")[0] if "," in ob.destinationFull else ob.destinationFull
+            total = price + ib.price
+            out_weekday = ob.departureTime.strftime("%Y-%m-%d %A %H:%M")
+            ret_weekday = ib.departureTime.strftime("%Y-%m-%d %A %H:%M")
+            out_leg = f"{out_weekday}  {price}€  {ob.origin}→{ob.destination}"
+            ret_leg = f"{ret_weekday}  {ib.price}€  {ib.origin}→{ib.destination}"
+            ryanair_url = _ryanair_booking_url(
+                ob.origin, ob.destination,
+                ob.departureTime.date().isoformat(),
+                ib.departureTime.date().isoformat(),
+                adults=adults,
+            )
+            lines.append("  <div class=\"trip\">")
+            lines.append(f"    <div class=\"trip-header\">{html.escape(dest_city)} ({total:.2f}€)</div>")
+            lines.append(f"    <div class=\"trip-details\">{html.escape(out_leg)}  |  {html.escape(ret_leg)}</div>")
+            lines.append(f"    <a class=\"book\" href=\"{html.escape(ryanair_url)}\" target=\"_blank\" rel=\"noopener\">Book</a>")
+            lines.append("  </div>")
+    if not cheapest_flights:
+        lines.append("  <p>(No round trips found.)</p>")
+    lines.append("</body>")
+    lines.append("</html>")
+    now = datetime.now()
+    filename = f"travel_helper_{now.strftime('%Y-%m-%d')}.html"
+    path = Path(filename).resolve()
+    path.write_text("\n".join(lines), encoding="utf-8")
+    print(path, file=sys.stderr)
+
+
 def collect_outbound_flights() -> list[tuple[object, object, float]]:
     """Collect return trips from Weeze/Köln. Only the departure must match: Thu after 5pm or Fri after 11pm.
     Return is 3–4 nights later (any time of day). Uses API time windows so we get trips in those slots.
@@ -224,6 +339,7 @@ def collect_outbound_flights() -> list[tuple[object, object, float]]:
 
 def run(
     output_json: bool = False,
+    output_html: bool = False,
     fetch_hotels: bool = True,
     adults: int = 2,
     rooms: int = 1,
@@ -305,6 +421,14 @@ def run(
         print(json.dumps(out, indent=2, ensure_ascii=False, default=str))
         return
 
+    if output_html:
+        _print_html(
+            cheapest_flights=cheapest_flights,
+            hotel_results=hotel_results,
+            adults=adults,
+        )
+        return
+
     # Human-readable output
     print("Travel helper: round trips Weeze/Köln → destination (departure: Thu after 5pm or Fri after 11pm only), 3–4 nights, return to Weeze/Köln (return time unrestricted)")
     print("=" * 80)
@@ -326,6 +450,13 @@ def run(
             out_leg = f"{out_weekday}  {price}€  {origin_city} ({outbound._origin_code})→{dest_city} ({outbound.destination})"
             ret_leg = f"{ret_weekday}  {ret.price}€  {ret_origin_city} ({ret.origin})→{ret_dest_city} ({ret.destination})"
             print(f"{i}. {dest_city} ({total:.2f}€): {out_leg}{LEG_SEP}{ret_leg}")
+            ryanair_url = _ryanair_booking_url(
+                outbound.origin, outbound.destination,
+                outbound.departureTime.date().isoformat(),
+                ret.departureTime.date().isoformat(),
+                adults=adults,
+            )
+            print(f"   {ryanair_url}")
             nights = (datetime.fromisoformat(departure).date() - datetime.fromisoformat(arrival).date()).days
             print(f"   Hotels ({nights} nights, {arrival} → {departure}):")
             for j, hotel in enumerate(r["hotels"], 1):
@@ -351,6 +482,13 @@ def run(
             out_leg = f"{out_weekday}  {price}€  {origin_city} ({ob._origin_code})→{dest_city} ({ob.destination})"
             ret_leg = f"{ret_weekday}  {ib.price}€  {ret_origin_city} ({ib.origin})→{ret_dest_city} ({ib.destination})"
             print(f"{i}. {dest_city} ({total:.2f}€): {out_leg}{LEG_SEP}{ret_leg}")
+            ryanair_url = _ryanair_booking_url(
+                ob.origin, ob.destination,
+                ob.departureTime.date().isoformat(),
+                ib.departureTime.date().isoformat(),
+                adults=adults,
+            )
+            print(f"   {ryanair_url}")
         if not cheapest_flights:
             print("(No round trips found for Thu after 5pm / Fri after 11pm from Weeze or Köln.)")
     if not TRIVAGO_AVAILABLE and fetch_hotels:
@@ -368,6 +506,11 @@ def main() -> None:
         "--json",
         action="store_true",
         help="Output JSON for OpenClaw/machine use",
+    )
+    parser.add_argument(
+        "--html",
+        action="store_true",
+        help="Write results to travel_helper_YYYY-MM-DD.html (full path printed to stderr)",
     )
     parser.add_argument(
         "--no-hotels",
@@ -394,6 +537,7 @@ def main() -> None:
     args = parser.parse_args()
     run(
         output_json=args.json,
+        output_html=args.html,
         fetch_hotels=not args.no_hotels,
         adults=args.adults,
         rooms=args.rooms,
