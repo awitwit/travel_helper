@@ -64,7 +64,7 @@ LEG_SEP = "  |  "    # between outbound and inbound on one line
 
 
 def _outbound_departure_allowed(dt: datetime) -> bool:
-    """True if outbound departure is Thursday after 5 pm or Friday after 11 pm (only departure is restricted)."""
+    """True if outbound departure is Thursday after 5 pm or Friday after 11 am (only departure is restricted)."""
     wd = dt.weekday()
     hour = dt.hour
     if wd == THURSDAY:
@@ -198,7 +198,7 @@ def collect_outbound_flights() -> list[tuple[object, object, float]]:
             if wd == THURSDAY:
                 outbound_time_from, outbound_time_to = "17:00", "23:59"
             elif wd == FRIDAY:
-                outbound_time_from, outbound_time_to = "23:00", "23:59"
+                outbound_time_from, outbound_time_to = "11:00", "23:59"
             else:
                 continue
             return_date_from = search_date + timedelta(days=RETURN_DAYS_MIN)
@@ -322,9 +322,10 @@ def run(
             origin_city = outbound.originFull.split(",")[0] if "," in outbound.originFull else outbound.originFull
             ret_origin_city = ret.originFull.split(",")[0] if "," in ret.originFull else ret.originFull
             ret_dest_city = ret.destinationFull.split(",")[0].strip() if "," in ret.destinationFull else ret.destination
+            total = price + ret.price
             out_leg = f"{out_weekday}  {price}€  {origin_city} ({outbound._origin_code})→{dest_city} ({outbound.destination})"
             ret_leg = f"{ret_weekday}  {ret.price}€  {ret_origin_city} ({ret.origin})→{ret_dest_city} ({ret.destination})"
-            print(f"{i}. {out_leg}{LEG_SEP}{ret_leg}")
+            print(f"{i}. {dest_city} ({total:.2f}€): {out_leg}{LEG_SEP}{ret_leg}")
             nights = (datetime.fromisoformat(departure).date() - datetime.fromisoformat(arrival).date()).days
             print(f"   Hotels ({nights} nights, {arrival} → {departure}):")
             for j, hotel in enumerate(r["hotels"], 1):
@@ -346,15 +347,16 @@ def run(
             dest_city = ob.destinationFull.split(",")[0] if "," in ob.destinationFull else ob.destinationFull
             ret_origin_city = ib.originFull.split(",")[0] if "," in ib.originFull else ib.originFull
             ret_dest_city = ib.destinationFull.split(",")[0] if "," in ib.destinationFull else ib.destination
+            total = price + ib.price
             out_leg = f"{out_weekday}  {price}€  {origin_city} ({ob._origin_code})→{dest_city} ({ob.destination})"
             ret_leg = f"{ret_weekday}  {ib.price}€  {ret_origin_city} ({ib.origin})→{ret_dest_city} ({ib.destination})"
-            print(f"{i}. {out_leg}{LEG_SEP}{ret_leg}")
+            print(f"{i}. {dest_city} ({total:.2f}€): {out_leg}{LEG_SEP}{ret_leg}")
         if not cheapest_flights:
             print("(No round trips found for Thu after 5pm / Fri after 11pm from Weeze or Köln.)")
-    if not hotel_results and fetch_hotels and cheapest_flights:
-        print("(No hotel results from Trivago.)", file=sys.stderr)
-    elif not TRIVAGO_AVAILABLE and fetch_hotels:
+    if not TRIVAGO_AVAILABLE and fetch_hotels:
         print("(Trivago MCP not installed: pip install 'mcp[cli]' for hotels.)", file=sys.stderr)
+    elif not hotel_results and fetch_hotels and cheapest_flights:
+        print("(No hotel results from Trivago. Check network and that Python/SSL support HTTPS.)", file=sys.stderr)
     print("=" * 80)
 
 
