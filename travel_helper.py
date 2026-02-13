@@ -19,9 +19,13 @@ import argparse
 import asyncio
 import html
 import json
+import os
 import re
+import smtplib
 import sys
 from datetime import datetime, timedelta
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from pathlib import Path
 
 # Project root on path for trivago package
@@ -31,6 +35,32 @@ if __name__ == "__main__" and __package__ is None:
         sys.path.insert(0, str(_root))
 
 from ryanair import Ryanair
+
+# Optional: airport coords for estimated flight duration
+try:
+    from ryanair.airport_utils import load_airports, get_distance_between_airports
+    _DURATION_AVAILABLE = True
+except ImportError:
+    _DURATION_AVAILABLE = False
+
+
+def _flight_duration_str(origin_iata: str, destination_iata: str) -> str:
+    """Return estimated flight duration as (Xh:Ym) or empty string if unknown."""
+    if not _DURATION_AVAILABLE:
+        return ""
+    try:
+        load_airports()
+        km = get_distance_between_airports(origin_iata, destination_iata)
+        total_minutes = (km / 800.0) * 60 + 38  # ~800 km/h + 38 min taxi/takeoff/landing
+        h = int(total_minutes // 60)
+        m = int(round(total_minutes % 60))
+        if m == 60:
+            h += 1
+            m = 0
+        return f" ({h}h:{m:02d}m)" if h > 0 or m > 0 else ""
+    except (KeyError, TypeError):
+        return ""
+
 
 # Trivago MCP (optional: only if mcp is installed)
 try:
@@ -208,13 +238,14 @@ async def fetch_hotels_for_cheapest_flights(
     return results
 
 
-def _print_html(
+def _build_html(
     cheapest_flights: list[tuple[object, object, float]],
     hotel_results: list[dict],
     adults: int = 2,
-) -> None:
-    """Output results as HTML with short 'Book' links for Ryanair."""
-    title = "Travel helper: round trips Weeze/Köln"
+) -> str:
+    """Build results as HTML string (same content as --html file)."""
+    title = "Fly cheap, stay cheap — your daily Ryanair + Trivago deals"
+    tagline = "Best-priced flights from Weeze & Köln (Thu eve / Fri) and lowest hotel rates from Trivago. Weekend getaways in 2–4 nights."
     lines = [
         "<!DOCTYPE html>",
         "<html lang=\"en\">",
@@ -223,7 +254,8 @@ def _print_html(
         f"  <title>{html.escape(title)}</title>",
         "  <style>",
         "    body { font-family: system-ui, sans-serif; margin: 1rem 2rem; max-width: 900px; }",
-        "    h1 { font-size: 1.25rem; }",
+        "    h1 { font-size: 1.35rem; color: #073590; margin-bottom: 0.25rem; }",
+        "    .tagline { color: #555; font-size: 0.95rem; line-height: 1.4; margin-bottom: 1rem; }",
         "    .trip { margin: 1rem 0; padding: 0.75rem; border: 1px solid #ccc; border-radius: 6px; }",
         "    .trip-header { font-weight: bold; margin-bottom: 0.25rem; }",
         "    .trip-details { color: #444; font-size: 0.95rem; }",
@@ -236,7 +268,7 @@ def _print_html(
         "</head>",
         "<body>",
         f"  <h1>{html.escape(title)}</h1>",
-        "  <p>Departure Thu after 5pm or Fri after 11pm; return 2–4 nights later.</p>",
+        f"  <p class=\"tagline\">{html.escape(tagline)}</p>",
     ]
     if hotel_results:
         for i, r in enumerate(hotel_results, 1):
@@ -246,8 +278,10 @@ def _print_html(
             total = r["price"] + ret.price
             out_weekday = outbound.departureTime.strftime("%Y-%m-%d %A %H:%M")
             ret_weekday = ret.departureTime.strftime("%Y-%m-%d %A %H:%M")
-            out_leg = f"{out_weekday}  {outbound.price}€  {outbound.origin}→{outbound.destination}"
-            ret_leg = f"{ret_weekday}  {ret.price}€  {ret.origin}→{ret.destination}"
+            out_dur = _flight_duration_str(outbound.origin, outbound.destination)
+            ret_dur = _flight_duration_str(ret.origin, ret.destination)
+            out_leg = f"{out_weekday}{out_dur}  {outbound.price}€  {outbound.origin}→{outbound.destination}"
+            ret_leg = f"{ret_weekday}{ret_dur}  {ret.price}€  {ret.origin}→{ret.destination}"
             ryanair_url = _ryanair_booking_url(
                 outbound.origin, outbound.destination,
                 outbound.departureTime.date().isoformat(),
@@ -278,8 +312,10 @@ def _print_html(
             total = price + ib.price
             out_weekday = ob.departureTime.strftime("%Y-%m-%d %A %H:%M")
             ret_weekday = ib.departureTime.strftime("%Y-%m-%d %A %H:%M")
-            out_leg = f"{out_weekday}  {price}€  {ob.origin}→{ob.destination}"
-            ret_leg = f"{ret_weekday}  {ib.price}€  {ib.origin}→{ib.destination}"
+            out_dur = _flight_duration_str(ob.origin, ob.destination)
+            ret_dur = _flight_duration_str(ib.origin, ib.destination)
+            out_leg = f"{out_weekday}{out_dur}  {price}€  {ob.origin}→{ob.destination}"
+            ret_leg = f"{ret_weekday}{ret_dur}  {ib.price}€  {ib.origin}→{ib.destination}"
             ryanair_url = _ryanair_booking_url(
                 ob.origin, ob.destination,
                 ob.departureTime.date().isoformat(),
@@ -298,22 +334,57 @@ def _print_html(
         lines.append("  <p>(No round trips found.)</p>")
     lines.append("</body>")
     lines.append("</html>")
+    return "\n".join(lines)
+
+
+def _print_html(
+    cheapest_flights: list[tuple[object, object, float]],
+    hotel_results: list[dict],
+    adults: int = 2,
+) -> None:
+    """Write results to travel_helper_YYYY-MM-DD.html and print path."""
+    html_str = _build_html(cheapest_flights, hotel_results, adults)
     now = datetime.now()
     filename = f"travel_helper_{now.strftime('%Y-%m-%d')}.html"
     path = Path(filename).resolve()
-    path.write_text("\n".join(lines), encoding="utf-8")
+    path.write_text(html_str, encoding="utf-8")
     print(path, file=sys.stderr)
 
 
-def collect_outbound_flights() -> list[tuple[object, object, float]]:
+def _send_email_html(html_body: str, to_email: str, subject: str | None = None) -> None:
+    """Send HTML email via Gmail. Requires env GMAIL_USER and GMAIL_APP_PASSWORD."""
+    gmail_user = os.environ.get("GMAIL_USER")
+    gmail_password = os.environ.get("GMAIL_APP_PASSWORD")
+    if not gmail_user or not gmail_password:
+        print("Cannot send email: set GMAIL_USER and GMAIL_APP_PASSWORD environment variables.", file=sys.stderr)
+        return
+    if subject is None:
+        subject = f"Fly cheap, stay cheap — your Ryanair + Trivago deals {datetime.now().strftime('%Y-%m-%d')}"
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = gmail_user
+    msg["To"] = to_email
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
+    try:
+        with smtplib.SMTP("smtp.gmail.com", 587) as server:
+            server.starttls()
+            server.login(gmail_user, gmail_password)
+            server.sendmail(gmail_user, to_email, msg.as_string())
+        print(f"Email sent to {to_email}", file=sys.stderr)
+    except Exception as e:
+        print(f"Failed to send email: {e}", file=sys.stderr)
+
+
+def collect_outbound_flights(days_ahead: int | None = None) -> list[tuple[object, object, float]]:
     """Collect return trips from Weeze/Köln. Only the departure must match: Thu after 5pm or Fri after 11pm.
     Return is 3–4 nights later (any time of day). Uses API time windows so we get trips in those slots.
     Returns list of (outbound, return_flight, outbound_price).
     """
     api = Ryanair(currency="EUR")
     outbound = []
+    n_days = days_ahead if days_ahead is not None else DAYS_AHEAD
     for airport_code, airport_name in ORIGIN_AIRPORTS:
-        for day_offset in range(0, DAYS_AHEAD):
+        for day_offset in range(0, n_days):
             search_date = datetime.today().date() + timedelta(days=day_offset)
             wd = search_date.weekday()
             if wd == THURSDAY:
@@ -351,9 +422,11 @@ def run(
     rooms: int = 1,
     num_cheapest_flights: int = 10,
     hotels_per_flight: int = 3,
+    days_ahead: int | None = None,
+    email: str | None = None,
 ) -> None:
     # 1. Collect return trips (only departure restricted: Thu after 5pm / Fri after 11pm; return 3–4 nights later, any time)
-    outbound_flights = collect_outbound_flights()
+    outbound_flights = collect_outbound_flights(days_ahead=days_ahead)
     # 2. Already sorted by price; take the N cheapest
     cheapest_flights = outbound_flights[:num_cheapest_flights]
 
@@ -433,10 +506,22 @@ def run(
             hotel_results=hotel_results,
             adults=adults,
         )
+        if not email:
+            return
+    if email:
+        html_str = _build_html(
+            cheapest_flights=cheapest_flights,
+            hotel_results=hotel_results,
+            adults=adults,
+        )
+        _send_email_html(html_str, email)
+        if output_html:
+            return
+        # If only --email (no --html), we're done
         return
 
     # Human-readable output
-    print("Travel helper: round trips Weeze/Köln → destination (departure: Thu after 5pm or Fri after 11pm only), 3–4 nights, return to Weeze/Köln (return time unrestricted)")
+    print("Fly cheap, stay cheap — Ryanair + Trivago deals from Weeze & Köln (Thu eve / Fri, 2–4 nights)")
     print("=" * 80)
     print("CHEAPEST ROUND TRIPS" + (" + HOTELS" if hotel_results else " (flights only)"))
     print("-" * 80)
@@ -449,14 +534,16 @@ def run(
             arrival, departure = r["arrival"], r["departure"]
             out_weekday = outbound.departureTime.strftime("%Y-%m-%d %A %H:%M")
             ret_weekday = ret.departureTime.strftime("%Y-%m-%d %A %H:%M")
+            out_dur = _flight_duration_str(outbound.origin, outbound.destination)
+            ret_dur = _flight_duration_str(ret.origin, ret.destination)
             origin_city = outbound.originFull.split(",")[0] if "," in outbound.originFull else outbound.originFull
             ret_origin_city = ret.originFull.split(",")[0] if "," in ret.originFull else ret.originFull
             ret_dest_city = ret.destinationFull.split(",")[0].strip() if "," in ret.destinationFull else ret.destination
             total = price + ret.price
             nights = (ret.departureTime.date() - outbound.departureTime.date()).days
             days = nights + 1
-            out_leg = f"{out_weekday}  {price}€  {origin_city} ({outbound._origin_code})→{dest_city} ({outbound.destination})"
-            ret_leg = f"{ret_weekday}  {ret.price}€  {ret_origin_city} ({ret.origin})→{ret_dest_city} ({ret.destination})"
+            out_leg = f"{out_weekday}{out_dur}  {price}€  {origin_city} ({outbound._origin_code})→{dest_city} ({outbound.destination})"
+            ret_leg = f"{ret_weekday}{ret_dur}  {ret.price}€  {ret_origin_city} ({ret.origin})→{ret_dest_city} ({ret.destination})"
             print(f"{i}. {dest_city} ({total:.2f}€) — {days} days, {nights} nights: {out_leg}{LEG_SEP}{ret_leg}")
             ryanair_url = _ryanair_booking_url(
                 outbound.origin, outbound.destination,
@@ -482,6 +569,8 @@ def run(
         for i, (ob, ib, price) in enumerate(cheapest_flights, 1):
             out_weekday = ob.departureTime.strftime("%Y-%m-%d %A %H:%M")
             ret_weekday = ib.departureTime.strftime("%Y-%m-%d %A %H:%M")
+            out_dur = _flight_duration_str(ob.origin, ob.destination)
+            ret_dur = _flight_duration_str(ib.origin, ib.destination)
             origin_city = ob.originFull.split(",")[0] if "," in ob.originFull else ob.originFull
             dest_city = ob.destinationFull.split(",")[0] if "," in ob.destinationFull else ob.destinationFull
             ret_origin_city = ib.originFull.split(",")[0] if "," in ib.originFull else ib.originFull
@@ -489,8 +578,8 @@ def run(
             total = price + ib.price
             nights = (ib.departureTime.date() - ob.departureTime.date()).days
             days = nights + 1
-            out_leg = f"{out_weekday}  {price}€  {origin_city} ({ob._origin_code})→{dest_city} ({ob.destination})"
-            ret_leg = f"{ret_weekday}  {ib.price}€  {ret_origin_city} ({ib.origin})→{ret_dest_city} ({ib.destination})"
+            out_leg = f"{out_weekday}{out_dur}  {price}€  {origin_city} ({ob._origin_code})→{dest_city} ({ob.destination})"
+            ret_leg = f"{ret_weekday}{ret_dur}  {ib.price}€  {ret_origin_city} ({ib.origin})→{ret_dest_city} ({ib.destination})"
             print(f"{i}. {dest_city} ({total:.2f}€) — {days} days, {nights} nights: {out_leg}{LEG_SEP}{ret_leg}")
             ryanair_url = _ryanair_booking_url(
                 ob.origin, ob.destination,
@@ -531,18 +620,32 @@ def main() -> None:
     parser.add_argument("--adults", type=int, default=2, help="Adults for hotel search")
     parser.add_argument("--rooms", type=int, default=1, help="Rooms for hotel search")
     parser.add_argument(
-        "--num-cheapest",
+        "--num-cheapest-flights",
         type=int,
         default=10,
         metavar="N",
         help="Number of cheapest round trips to show and fetch hotels for (default: 10)",
     )
     parser.add_argument(
-        "--hotels-per-flight",
+        "--cheapest-hotels-per-flight",
         type=int,
         default=3,
         metavar="M",
-        help="Number of hotels to fetch per flight (default: 3)",
+        help="Number of cheapest hotels to fetch per flight (default: 3)",
+    )
+    parser.add_argument(
+        "--days-ahead",
+        type=int,
+        default=120,
+        metavar="N",
+        help="Search for departures in the next N days (default: 120)",
+    )
+    parser.add_argument(
+        "--email",
+        type=str,
+        default=None,
+        metavar="ADDRESS",
+        help="Send results as HTML email to ADDRESS (Gmail: set GMAIL_USER and GMAIL_APP_PASSWORD). Example: --email you@example.com",
     )
     args = parser.parse_args()
     run(
@@ -551,8 +654,10 @@ def main() -> None:
         fetch_hotels=not args.no_hotels,
         adults=args.adults,
         rooms=args.rooms,
-        num_cheapest_flights=args.num_cheapest,
-        hotels_per_flight=args.hotels_per_flight,
+        num_cheapest_flights=args.num_cheapest_flights,
+        hotels_per_flight=args.cheapest_hotels_per_flight,
+        days_ahead=args.days_ahead,
+        email=args.email,
     )
 
 
