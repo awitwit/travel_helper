@@ -100,7 +100,7 @@ python3 -m venv .venv-travel
 .venv-travel/bin/python travel_helper.py --no-hotels
 
 # Custom number of flights and hotels per flight
-.venv-travel/bin/python travel_helper.py --num-cheapest 5 --hotels-per-flight 3
+.venv-travel/bin/python travel_helper.py --num-cheapest-flights 5 --cheapest-hotels-per-flight 3
 
 # Hotel search parameters
 .venv-travel/bin/python travel_helper.py --adults 2 --rooms 1
@@ -115,8 +115,8 @@ python3 -m venv .venv-travel
 | `--no-hotels` | — | Skip Trivago hotel fetch (flights only) |
 | `--adults` | 2 | Adults for hotel search |
 | `--rooms` | 1 | Rooms for hotel search |
-| `--num-cheapest` | 10 | Number of cheapest round trips to show and fetch hotels for |
-| `--hotels-per-flight` | 3 | Number of hotels to fetch per flight |
+| `--num-cheapest-flights` | 10 | Number of cheapest round trips to show and fetch hotels for |
+| `--cheapest-hotels-per-flight` | 3 | Number of cheapest hotels to fetch per flight |
 | `--days-ahead` | 120 | Search for departures in the next N days |
 | `--email` | — | Send results as HTML to this address (via Gmail; see below) |
 
@@ -125,5 +125,5 @@ python3 -m venv .venv-travel
 ```bash
 export GMAIL_USER=your.gmail@gmail.com
 export GMAIL_APP_PASSWORD=xxxx-xxxx-xxxx-xxxx
-.venv-travel/bin/python travel_helper.py --email ammar.sahib@yahoo.com --no-hotels
+.venv-travel/bin/python travel_helper.py --num-cheapest-flights 20 --days-ahead 180 --cheapest-hotels-per-flight 1 --email ammar.sahib@yahoo.com 
 ```
