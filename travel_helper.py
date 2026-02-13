@@ -72,6 +72,19 @@ try:
 except ImportError:
     TRIVAGO_AVAILABLE = False
 
+# GeoTemp Travel MCP (optional: weather + attractions per destination)
+try:
+    from mcp.client.sse import sse_client
+    from geotemp_fetch_mcp import GEOTEMP_MCP_URL, get_attractions, get_weather
+
+    GEOTEMP_AVAILABLE = True
+except ImportError:
+    GEOTEMP_AVAILABLE = False
+    sse_client = None
+    get_weather = None
+    get_attractions = None
+    GEOTEMP_MCP_URL = None
+
 # --------------- Config: Weeze + Köln, Thu eve / Fri late outbound, 3–4 nights ---------------
 ORIGIN_AIRPORTS = [
     ("CGN", "Köln"),
@@ -238,14 +251,186 @@ async def fetch_hotels_for_cheapest_flights(
     return results
 
 
+def _dest_city_from_flight(ob: object) -> str:
+    """Destination city string for a trip (for GeoTemp / display)."""
+    dest_full = getattr(ob, "destinationFull", None) or ""
+    if "," in dest_full:
+        return dest_full.split(",")[0].strip()
+    return dest_full.strip() or getattr(ob, "destination", "")
+
+
+async def _fetch_geotemp_for_trips(
+    cheapest_flights: list[tuple[object, object, float]],
+    hotel_results: list[dict],
+) -> dict | None:
+    """Fetch weather (per trip date range) and attractions (per destination) from GeoTemp MCP.
+    Returns {'weather': {(dest, start_date, end_date): list}, 'attractions': {dest: list}} or None on error.
+    """
+    if not GEOTEMP_AVAILABLE or not sse_client:
+        return None
+    # Collect (dest_city, start_iso, end_iso) and unique destinations
+    weather_keys: list[tuple[str, str, str]] = []
+    destinations: set[str] = set()
+    if hotel_results:
+        for r in hotel_results:
+            dest = r["destination"]
+            start_iso = r["arrival"]  # YYYY-MM-DD
+            end_iso = r["departure"]
+            weather_keys.append((dest, start_iso, end_iso))
+            destinations.add(dest)
+    else:
+        for ob, ib, _ in cheapest_flights:
+            dest = _dest_city_from_flight(ob)
+            start_iso = ob.departureTime.date().isoformat()
+            end_iso = ib.departureTime.date().isoformat()
+            weather_keys.append((dest, start_iso, end_iso))
+            destinations.add(dest)
+    if not weather_keys and not destinations:
+        return None
+    weather_by_key: dict[tuple[str, str, str], list] = {}
+    attractions_by_dest: dict[str, list] = {}
+    try:
+        async with sse_client(GEOTEMP_MCP_URL) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                for (dest, start_iso, end_iso) in weather_keys:
+                    key = (dest, start_iso, end_iso)
+                    if key not in weather_by_key:
+                        dest_api = dest.split(" - ")[0].strip() if " - " in dest else dest
+                        month = None
+                        try:
+                            month = int(start_iso.split("-")[1])
+                        except (IndexError, ValueError):
+                            pass
+                        w = await get_weather(
+                            session, dest_api, start_iso, end_iso, month=month
+                        )
+                        weather_by_key[key] = w if isinstance(w, list) else ([w] if w else [])
+                for dest in destinations:
+                    if dest not in attractions_by_dest:
+                        dest_api = dest.split(" - ")[0].strip() if " - " in dest else dest
+                        a = await get_attractions(session, dest_api, limit=10)
+                        attractions_by_dest[dest] = a if isinstance(a, list) else ([] if not a else [a])
+    except Exception as e:
+        print(f"GeoTemp MCP unavailable: {e}", file=sys.stderr)
+        return None
+    return {"weather": weather_by_key, "attractions": attractions_by_dest}
+
+
+def _format_weather_item(item: dict) -> str | None:
+    """Format a single weather day dict for display. Returns None if item is an error message."""
+    if not isinstance(item, dict):
+        return str(item)
+    if item.get("error"):
+        return None
+    # GeoTemp month summary: { city, month, weather_summary: { avg_temperature_mean, avg_rain_mm, ... } }
+    summary = item.get("weather_summary")
+    if isinstance(summary, dict):
+        parts = []
+        if item.get("city"):
+            parts.append(str(item["city"]))
+        if item.get("month"):
+            parts.append(str(item["month"]))
+        avg_temp = summary.get("avg_temperature_mean") or summary.get("avg_temp")
+        if avg_temp is not None:
+            parts.append(f"avg {avg_temp}°C")
+        rain = summary.get("avg_rain_mm") or summary.get("rain_mm")
+        if rain is not None:
+            parts.append(f"rain {rain} mm")
+        if summary.get("description"):
+            parts.append(str(summary["description"]))
+        if parts:
+            return " — ".join(str(p) for p in parts)
+    # Daily-style: date, temperature, condition
+    parts = []
+    if "date" in item:
+        parts.append(str(item["date"]))
+    if "temperature" in item:
+        parts.append(f"{item['temperature']}°C")
+    elif "temp" in item:
+        parts.append(f"{item['temp']}°C")
+    if "condition" in item:
+        parts.append(str(item["condition"]))
+    elif "description" in item:
+        parts.append(str(item["description"]))
+    if parts:
+        return " — ".join(parts)
+    # Fallback: full JSON, no truncation
+    return json.dumps(item, ensure_ascii=False)
+
+
+def _format_attraction_item(item: dict) -> str:
+    """Format a single attraction dict for display."""
+    if not isinstance(item, dict):
+        return str(item)
+    name = item.get("name") or item.get("title") or item.get("attraction") or "—"
+    return str(name)
+
+
+def _print_weather_attractions_text(
+    dest_city: str,
+    out_date: object,
+    ret_date: object,
+    weather_by_key: dict,
+    attractions_by_dest: dict,
+) -> None:
+    """Print weather and attractions for one trip (human-readable)."""
+    start_iso = out_date.isoformat() if hasattr(out_date, "isoformat") else str(out_date)
+    end_iso = ret_date.isoformat() if hasattr(ret_date, "isoformat") else str(ret_date)
+    key = (dest_city, start_iso, end_iso)
+    weather_list = weather_by_key.get(key) or []
+    att_list = attractions_by_dest.get(dest_city) or []
+    weather_lines = [s for w in weather_list[:7] if (s := _format_weather_item(w))]
+    if weather_lines:
+        print("   Weather:")
+        for line in weather_lines:
+            print(f"     {line}")
+    if att_list:
+        print("   Attractions:")
+        for a in att_list[:10]:
+            print(f"     • {_format_attraction_item(a)}")
+
+
+def _add_weather_attractions_html(
+    lines: list[str],
+    dest_city: str,
+    out_date: object,
+    ret_date: object,
+    weather_by_key: dict,
+    attractions_by_dest: dict,
+) -> None:
+    """Append weather and attractions blocks to lines (HTML)."""
+    start_iso = out_date.isoformat() if hasattr(out_date, "isoformat") else str(out_date)
+    end_iso = ret_date.isoformat() if hasattr(ret_date, "isoformat") else str(ret_date)
+    key = (dest_city, start_iso, end_iso)
+    weather_list = weather_by_key.get(key) or []
+    att_list = attractions_by_dest.get(dest_city) or []
+    weather_lines = [s for w in weather_list[:7] if (s := _format_weather_item(w))]
+    if weather_lines:
+        lines.append("    <div class=\"weather\">")
+        lines.append("      <div class=\"weather-title\">Weather</div>")
+        for line in weather_lines:
+            lines.append(f"      <div>{html.escape(line)}</div>")
+        lines.append("    </div>")
+    if att_list:
+        lines.append("    <div class=\"attractions\">")
+        lines.append("      <div class=\"attractions-title\">Attractions</div>")
+        for a in att_list[:10]:
+            lines.append(f"      <div>{html.escape(_format_attraction_item(a))}</div>")
+        lines.append("    </div>")
+
+
 def _build_html(
     cheapest_flights: list[tuple[object, object, float]],
     hotel_results: list[dict],
     adults: int = 2,
+    travel_data: dict | None = None,
 ) -> str:
     """Build results as HTML string (same content as --html file)."""
     title = "Fly cheap, stay cheap — your daily Ryanair + Trivago deals"
     tagline = "Best-priced flights from Weeze & Köln (Thu eve / Fri) and lowest hotel rates from Trivago. Weekend getaways in 2–4 nights."
+    weather_by_key = (travel_data or {}).get("weather") or {}
+    attractions_by_dest = (travel_data or {}).get("attractions") or {}
     lines = [
         "<!DOCTYPE html>",
         "<html lang=\"en\">",
@@ -261,9 +446,10 @@ def _build_html(
         "    .trip-details { color: #444; font-size: 0.95rem; }",
         "    a.trip-link { color: #073590; text-decoration: none; }",
         "    a.trip-link:hover { text-decoration: underline; }",
-        "    .hotels { margin-top: 0.5rem; font-size: 0.9rem; }",
         "    .hotel { margin: 0.2rem 0; }",
         "    .hotel a { color: #073590; }",
+        "    .flight-title, .weather-title, .attractions-title, .hotels-title { font-weight: 600; margin-bottom: 0.2rem; }",
+        "    .flight, .weather, .attractions, .hotels { margin-top: 0.5rem; font-size: 0.9rem; color: #444; }",
         "  </style>",
         "</head>",
         "<body>",
@@ -294,8 +480,13 @@ def _build_html(
             days = nights + 1
             lines.append("  <div class=\"trip\">")
             lines.append(f"    <div class=\"trip-header\">{html.escape(dest_city)} ({total:.2f}€) — {days} days, {nights} nights</div>")
-            lines.append(f"    <a class=\"trip-details trip-link\" href=\"{html.escape(ryanair_url)}\" target=\"_blank\" rel=\"noopener\">{html.escape(out_leg)}  |  {html.escape(ret_leg)}</a>")
+            lines.append("    <div class=\"flight\">")
+            lines.append("      <div class=\"flight-title\">Flight</div>")
+            lines.append(f"      <a class=\"trip-details trip-link\" href=\"{html.escape(ryanair_url)}\" target=\"_blank\" rel=\"noopener\">{html.escape(out_leg)}  |  {html.escape(ret_leg)}</a>")
+            lines.append("    </div>")
+            _add_weather_attractions_html(lines, dest_city, out_date, ret_date, weather_by_key, attractions_by_dest)
             lines.append("    <div class=\"hotels\">")
+            lines.append("      <div class=\"hotels-title\">Hotels</div>")
             for hotel in r["hotels"]:
                 name = hotel.get("Accommodation Name") or hotel.get("accommodation_name") or "—"
                 url = hotel.get("Accommodation URL") or hotel.get("accommodation_url") or ""
@@ -328,7 +519,11 @@ def _build_html(
             days = nights + 1
             lines.append("  <div class=\"trip\">")
             lines.append(f"    <div class=\"trip-header\">{html.escape(dest_city)} ({total:.2f}€) — {days} days, {nights} nights</div>")
-            lines.append(f"    <a class=\"trip-details trip-link\" href=\"{html.escape(ryanair_url)}\" target=\"_blank\" rel=\"noopener\">{html.escape(out_leg)}  |  {html.escape(ret_leg)}</a>")
+            lines.append("    <div class=\"flight\">")
+            lines.append("      <div class=\"flight-title\">Flight</div>")
+            lines.append(f"      <a class=\"trip-details trip-link\" href=\"{html.escape(ryanair_url)}\" target=\"_blank\" rel=\"noopener\">{html.escape(out_leg)}  |  {html.escape(ret_leg)}</a>")
+            lines.append("    </div>")
+            _add_weather_attractions_html(lines, dest_city, out_date, ret_date, weather_by_key, attractions_by_dest)
             lines.append("  </div>")
     if not cheapest_flights:
         lines.append("  <p>(No round trips found.)</p>")
@@ -341,9 +536,10 @@ def _print_html(
     cheapest_flights: list[tuple[object, object, float]],
     hotel_results: list[dict],
     adults: int = 2,
+    travel_data: dict | None = None,
 ) -> None:
     """Write results to travel_helper_YYYY-MM-DD.html and print path."""
-    html_str = _build_html(cheapest_flights, hotel_results, adults)
+    html_str = _build_html(cheapest_flights, hotel_results, adults, travel_data)
     now = datetime.now()
     filename = f"travel_helper_{now.strftime('%Y-%m-%d')}.html"
     path = Path(filename).resolve()
@@ -444,6 +640,16 @@ def run(
             )
         )
 
+    # 4. Optional: weather + attractions per destination (GeoTemp MCP)
+    travel_data = None
+    if GEOTEMP_AVAILABLE and (cheapest_flights or hotel_results):
+        if not output_json:
+            print("Fetching weather and attractions (GeoTemp)...", file=sys.stderr)
+        try:
+            travel_data = asyncio.run(_fetch_geotemp_for_trips(cheapest_flights, hotel_results))
+        except Exception as e:
+            print(f"GeoTemp fetch failed: {e}", file=sys.stderr)
+
     if output_json:
         # Prefer hotel_results when present; otherwise output flight-only from cheapest_flights
         if hotel_results:
@@ -505,6 +711,7 @@ def run(
             cheapest_flights=cheapest_flights,
             hotel_results=hotel_results,
             adults=adults,
+            travel_data=travel_data,
         )
         if not email:
             return
@@ -513,6 +720,7 @@ def run(
             cheapest_flights=cheapest_flights,
             hotel_results=hotel_results,
             adults=adults,
+            travel_data=travel_data,
         )
         _send_email_html(html_str, email)
         if output_html:
@@ -521,6 +729,8 @@ def run(
         return
 
     # Human-readable output
+    weather_by_key = (travel_data or {}).get("weather") or {}
+    attractions_by_dest = (travel_data or {}).get("attractions") or {}
     print("Fly cheap, stay cheap — Ryanair + Trivago deals from Weeze & Köln (Thu eve / Fri, 2–4 nights)")
     print("=" * 80)
     print("CHEAPEST ROUND TRIPS" + (" + HOTELS" if hotel_results else " (flights only)"))
@@ -544,7 +754,9 @@ def run(
             days = nights + 1
             out_leg = f"{out_weekday}{out_dur}  {price}€  {origin_city} ({outbound._origin_code})→{dest_city} ({outbound.destination})"
             ret_leg = f"{ret_weekday}{ret_dur}  {ret.price}€  {ret_origin_city} ({ret.origin})→{ret_dest_city} ({ret.destination})"
-            print(f"{i}. {dest_city} ({total:.2f}€) — {days} days, {nights} nights: {out_leg}{LEG_SEP}{ret_leg}")
+            print(f"{i}. {dest_city} ({total:.2f}€) — {days} days, {nights} nights")
+            print("Flight")
+            print(f"   {out_leg}{LEG_SEP}{ret_leg}")
             ryanair_url = _ryanair_booking_url(
                 outbound.origin, outbound.destination,
                 outbound.departureTime.date().isoformat(),
@@ -552,18 +764,20 @@ def run(
                 adults=adults,
             )
             print(f"   {ryanair_url}")
+            _print_weather_attractions_text(dest_city, outbound.departureTime.date(), ret.departureTime.date(), weather_by_key, attractions_by_dest)
             nights = (datetime.fromisoformat(departure).date() - datetime.fromisoformat(arrival).date()).days
-            print(f"   Hotels ({nights} nights, {arrival} → {departure}):")
+            print("Hotels")
+            print(f"   {nights} nights, {arrival} → {departure}")
             for j, hotel in enumerate(r["hotels"], 1):
                 name = hotel.get("Accommodation Name") or hotel.get("accommodation_name") or "—"
                 price_night = hotel.get("Price Per Night") or hotel.get("price_per_night") or "—"
                 price_stay = hotel.get("Price Per Stay") or hotel.get("price_per_stay") or "—"
                 url = hotel.get("Accommodation URL") or hotel.get("accommodation_url") or ""
-                print(f"     {j}. {name}  |  {price_night} (total {price_stay})")
+                print(f"   {j}. {name}  |  {price_night} (total {price_stay})")
                 if url:
-                    print(f"        {url}")
+                    print(f"      {url}")
             if not r["hotels"]:
-                print("     (none found)")
+                print("   (none found)")
             print()
     else:
         for i, (ob, ib, price) in enumerate(cheapest_flights, 1):
@@ -580,7 +794,9 @@ def run(
             days = nights + 1
             out_leg = f"{out_weekday}{out_dur}  {price}€  {origin_city} ({ob._origin_code})→{dest_city} ({ob.destination})"
             ret_leg = f"{ret_weekday}{ret_dur}  {ib.price}€  {ret_origin_city} ({ib.origin})→{ret_dest_city} ({ib.destination})"
-            print(f"{i}. {dest_city} ({total:.2f}€) — {days} days, {nights} nights: {out_leg}{LEG_SEP}{ret_leg}")
+            print(f"{i}. {dest_city} ({total:.2f}€) — {days} days, {nights} nights")
+            print("Flight")
+            print(f"   {out_leg}{LEG_SEP}{ret_leg}")
             ryanair_url = _ryanair_booking_url(
                 ob.origin, ob.destination,
                 ob.departureTime.date().isoformat(),
@@ -588,6 +804,7 @@ def run(
                 adults=adults,
             )
             print(f"   {ryanair_url}")
+            _print_weather_attractions_text(dest_city, ob.departureTime.date(), ib.departureTime.date(), weather_by_key, attractions_by_dest)
         if not cheapest_flights:
             print("(No round trips found for Thu after 5pm / Fri after 11pm from Weeze or Köln.)")
     if not TRIVAGO_AVAILABLE and fetch_hotels:
