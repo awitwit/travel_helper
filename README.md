@@ -80,6 +80,10 @@ python3 -m venv .venv-travel
 .venv-travel/bin/pip install ryanair-py requests backoff "mcp[cli]"
 ```
 
+**Python 3.10+ required for hotels.** The `mcp` package (Trivago MCP client) needs Python 3.10 or newer. If `pip3 install "mcp[cli]"` fails with "Could not find a version that satisfies the requirement mcp[cli]", use a newer Python: e.g. on macOS run `brew install python@3.12`, then `python3.12 -m venv .venv-travel` and `.venv-travel/bin/pip install ryanair-py requests backoff "mcp[cli]"`.
+
+**Running on another machine / “No hotels”?** Run the script with the **project venv** and ensure `mcp[cli]` is installed in that env (`pip install "mcp[cli]"`). If you use system `python3` without the venv, the script will show flights but report no hotels because the Trivago MCP client is missing there. You should then see: *“Trivago MCP not installed: pip install 'mcp[cli]' for hotels.”* If you see a urllib3/OpenSSL warning (e.g. LibreSSL 2.8.3), HTTPS to the Trivago MCP may fail; use a Python built with OpenSSL 1.1.1+ or the project venv where possible.
+
 ### Run
 
 ```bash
